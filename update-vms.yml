@@ -1,0 +1,83 @@
+---
+- name: Run on-demand backups to PBS ("backups")
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # --- Your cluster details ---
+    pve_host: "192.168.1.10"
+    pve_user: "root@pam"                 # <-- user that owns the token
+    pve_token_id: "ansible"                     # <-- token *name* only (not user!token)
+    pve_token_secret: 73045074-0610-42bc-9d17-c5d1476ba264    #"{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
+    pbs_storage: "backups"
+
+    # Choose ONE mode
+    vm_list: [100,116,117,122,119]                # set [] to use Option B
+    pve_node: "pve"
+
+    #retention_rule: "keep-last=14,keep-daily=5,keep-weekly=4,keep-monthly=4,keep-yearly=0"
+    backup_desc: "Ansible backup before updates"
+    backup_mode: "snapshot"
+    wait_timeout_seconds: 7200
+
+  tasks:
+    - name: Backup selected VMIDs (Option A)
+      community.proxmox.proxmox_backup:
+        api_host: "{{ pve_host }}"
+        api_user: "{{ pve_user }}"
+        api_token_id: "{{ pve_token_id }}"
+        api_token_secret: "{{ pve_token_secret }}"
+        validate_certs: false
+        storage: "{{ pbs_storage }}"
+        mode: include
+        vmids: "{{ vm_list }}"
+        backup_mode: "{{ backup_mode }}"
+        compress: zstd
+        description: "{{ backup_desc }}"
+        #retention: "{{ retention_rule }}"
+        wait: true
+        wait_timeout: "{{ wait_timeout_seconds }}"
+      when: vm_list | length > 0
+
+    - name: Backup ALL VMs on node (Option B)
+      community.proxmox.proxmox_backup:
+        api_host: "{{ pve_host }}"
+        api_user: "{{ pve_user }}"
+        api_token_id: "{{ pve_token_id }}"
+        api_token_secret: "{{ pve_token_secret }}"
+        validate_certs: false
+        storage: "{{ pbs_storage }}"
+        mode: all
+        node: "{{ pve_node }}"
+        backup_mode: "{{ backup_mode }}"
+        compress: zstd
+        description: "{{ backup_desc }}"
+        #retention: "{{ retention_rule }}"
+        wait: true
+        wait_timeout: "{{ wait_timeout_seconds }}"
+      when: vm_list | length == 0 and (pve_node | length > 0)
+
+
+- name: Update Ubuntu System
+  hosts: all
+  become: yes
+  tasks:
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+
+    - name: Reboot if needed
+      reboot:
+        msg: "Reboot initiated by Ansible after upgrade"
+        connect_timeout: 5
+        reboot_timeout: 600
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+      when: ansible_facts.packages['linux-image-generic'] is defined
