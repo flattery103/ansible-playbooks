@@ -1,10 +1,4 @@
 ---
-pre_tasks:
-  - name: Ensure ansible-core is new enough for community.proxmox
-    assert:
-      that: "ansible_version.full is version('2.17', '>=')"
-      fail_msg: "This play requires ansible-core >= 2.17 (current: {{ ansible_version.full }})"
-
 - name: Run on-demand backups to PBS ("backups")
   hosts: localhost
   gather_facts: false
