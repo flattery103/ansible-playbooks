@@ -8,7 +8,7 @@
     pve_host: "192.168.1.10"
     pve_user: "root@pam"                 # <-- user that owns the token
     pve_token_id: "ansible"                     # <-- token *name* only (not user!token)
-    pve_token_secret: 73045074-0610-42bc-9d17-c5d1476ba264    #"{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
+    pve_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
     pbs_storage: "backups"
 
     # Choose ONE mode
