@@ -5,18 +5,18 @@
 
   vars:
     # --- Your cluster details ---
-    pve_host: "192.168.1.10"
-    pve_user: "root@pam"                 # <-- user that owns the token
-    pve_token_id: "ansible"                     # <-- token *name* only (not user!token)
+    pve_host: "{{ lookup('env', 'pve_host') }}"
+    pve_user: "{{ lookup('env', 'pve_user') }}"                 # <-- user that owns the token
+    pve_token_id: "{{ lookup('env', 'pve_token_id') }}"                    # <-- token *name* only (not user!token)
     pve_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
-    pbs_storage: "backups"
+    pbs_storage: "{{ lookup('env', 'pbs_storage') }}"
 
     # Choose ONE mode
     vm_list: [100,116,117,122,119]                # set [] to use Option B
     pve_node: "pve"
 
     #retention_rule: "keep-last=14,keep-daily=5,keep-weekly=4,keep-monthly=4,keep-yearly=0"
-    backup_desc: "Ansible backup before updates"
+    backup_desc: "{{ lookup('env', 'backup_desc') }}"
     backup_mode: "snapshot"
     wait_timeout_seconds: 7200
 
