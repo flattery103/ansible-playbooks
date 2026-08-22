@@ -298,15 +298,15 @@
       delay: 10
       until: final_ha_info.rc == 0
 
-    - name: Verify Home Assistant Core is running
-      ansible.builtin.raw: ha core info --no-progress --raw-json
-      register: final_core_raw
+    - name: Verify Home Assistant is running
+      ansible.builtin.raw: ha info --no-progress --raw-json
+      register: final_ha_health
       changed_when: false
       retries: 30
       delay: 10
       until:
-        - final_core_raw.rc == 0
-        - (final_core_raw.stdout | trim | from_json).data.state == "running"
+        - final_ha_health.rc == 0
+        - (final_ha_health.stdout | trim | from_json).data.state == "running"
 
     - name: Display final Home Assistant status
       ansible.builtin.debug:
