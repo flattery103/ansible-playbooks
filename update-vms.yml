@@ -1,27 +1,71 @@
 ---
-- name: Run on-demand backups to PBS ("backups")
+# ============================================================
+# PLAY 1 - Back up Proxmox VMs to PBS before maintenance
+# ============================================================
+
+- name: Back up Proxmox VMs to PBS before maintenance
   hosts: localhost
   gather_facts: false
+  any_errors_fatal: true
 
   vars:
-    # --- Your cluster details ---
+    # Proxmox API details supplied by Semaphore environment variables
     pve_host: "{{ lookup('env', 'pve_host') }}"
-    pve_user: "{{ lookup('env', 'pve_user') }}"                 # <-- user that owns the token
-    pve_token_id: "{{ lookup('env', 'pve_token_id') }}"                    # <-- token *name* only (not user!token)
+    pve_user: "{{ lookup('env', 'pve_user') }}"
+    pve_token_id: "{{ lookup('env', 'pve_token_id') }}"
     pve_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
     pbs_storage: "{{ lookup('env', 'pbs_storage') }}"
+    backup_desc: "{{ lookup('env', 'backup_desc') }}"
 
-    # Choose ONE mode
-    vm_list: [100,116,117,122,119]                # set [] to use Option B
+    # --------------------------------------------------------
+    # BACKUP MODE
+    #
+    # Put VMIDs here to back up only selected VMs.
+    # Set vm_list: [] to back up ALL VMs on pve_node.
+    # --------------------------------------------------------
+    vm_list:
+      - 100
+      - 116
+      - 117
+      - 122
+      - 119
+
     pve_node: "pve"
 
-    #retention_rule: "keep-last=14,keep-daily=5,keep-weekly=4,keep-monthly=4,keep-yearly=0"
-    backup_desc: "{{ lookup('env', 'backup_desc') }}"
     backup_mode: "snapshot"
     wait_timeout_seconds: 7200
 
+    # Retention remains controlled by PBS for now.
+    # retention_rule: "keep-last=14,keep-daily=5,keep-weekly=4,keep-monthly=4,keep-yearly=0"
+
   tasks:
-    - name: Backup selected VMIDs (Option A)
+
+    - name: Verify required Proxmox/PBS settings are present
+      ansible.builtin.assert:
+        that:
+          - pve_host | length > 0
+          - pve_user | length > 0
+          - pve_token_id | length > 0
+          - pve_token_secret | length > 0
+          - pbs_storage | length > 0
+        fail_msg: >
+          Required Proxmox/PBS environment variables are missing.
+          Maintenance has been stopped before any servers were updated.
+        success_msg: "Proxmox/PBS configuration validated."
+
+    - name: Verify backup scope is valid
+      ansible.builtin.assert:
+        that:
+          - (vm_list | length > 0) or (pve_node | length > 0)
+        fail_msg: >
+          No VM list or Proxmox node was specified.
+          Maintenance has been stopped.
+
+    # --------------------------------------------------------
+    # OPTION A - Back up only specified VMIDs
+    # --------------------------------------------------------
+
+    - name: Back up selected VMIDs
       community.proxmox.proxmox_backup:
         api_host: "{{ pve_host }}"
         api_user: "{{ pve_user }}"
@@ -34,12 +78,26 @@
         backup_mode: "{{ backup_mode }}"
         compress: zstd
         description: "{{ backup_desc }}"
-        #retention: "{{ retention_rule }}"
         wait: true
         wait_timeout: "{{ wait_timeout_seconds }}"
+        # retention: "{{ retention_rule }}"
+      register: selected_backup
       when: vm_list | length > 0
 
-    - name: Backup ALL VMs on node (Option B)
+    - name: Verify selected VM backup completed successfully
+      ansible.builtin.assert:
+        that:
+          - selected_backup is succeeded
+        fail_msg: >
+          PBS backup failed. Server updates have been cancelled.
+        success_msg: "PBS backup completed successfully."
+      when: vm_list | length > 0
+
+    # --------------------------------------------------------
+    # OPTION B - Back up every VM on the specified node
+    # --------------------------------------------------------
+
+    - name: Back up all VMs on Proxmox node
       community.proxmox.proxmox_backup:
         api_host: "{{ pve_host }}"
         api_user: "{{ pve_user }}"
@@ -52,32 +110,95 @@
         backup_mode: "{{ backup_mode }}"
         compress: zstd
         description: "{{ backup_desc }}"
-        #retention: "{{ retention_rule }}"
         wait: true
         wait_timeout: "{{ wait_timeout_seconds }}"
-      when: vm_list | length == 0 and (pve_node | length > 0)
+        # retention: "{{ retention_rule }}"
+      register: all_backup
+      when:
+        - vm_list | length == 0
+        - pve_node | length > 0
+
+    - name: Verify full-node backup completed successfully
+      ansible.builtin.assert:
+        that:
+          - all_backup is succeeded
+        fail_msg: >
+          PBS backup failed. Server updates have been cancelled.
+        success_msg: "PBS backup completed successfully."
+      when:
+        - vm_list | length == 0
+        - pve_node | length > 0
 
 
-- name: Update Ubuntu System
+# ============================================================
+# PLAY 2 - Patch Ubuntu servers
+# ============================================================
+
+- name: Update Ubuntu servers safely
   hosts: all
-  become: yes
+  become: true
+  gather_facts: true
+
+  # Patch one machine at a time.
+  # The next server will not begin until the current one finishes.
+  serial: 1
+
+  # If a server fails during maintenance, stop the run rather
+  # than continuing to patch the remaining systems.
+  any_errors_fatal: true
+
   tasks:
 
-    - name: Update apt cache
-      apt:
-        update_cache: yes
+    - name: Verify target is Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == "Ubuntu"
+        fail_msg: >
+          {{ inventory_hostname }} is not Ubuntu.
+          Maintenance has been stopped to prevent applying apt tasks
+          to an unsupported system.
 
-    - name: Upgrade all packages
-      apt:
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install all available package upgrades
+      ansible.builtin.apt:
         upgrade: dist
-        autoremove: yes
-        autoclean: yes
 
-    - name: Reboot if needed
-      reboot:
-        msg: "Reboot initiated by Ansible after upgrade"
+    - name: Remove packages that are no longer required
+      ansible.builtin.apt:
+        autoremove: true
+
+    - name: Clean obsolete package files
+      ansible.builtin.apt:
+        autoclean: true
+
+    - name: Check whether Ubuntu requires a reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Display reboot requirement
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}
+          {{ 'requires a reboot.' if reboot_required.stat.exists
+             else 'does not require a reboot.' }}
+
+    - name: Reboot server when required
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible after system updates"
         connect_timeout: 5
         reboot_timeout: 600
         pre_reboot_delay: 0
         post_reboot_delay: 30
-      when: ansible_facts.packages['linux-image-generic'] is defined
+      when: reboot_required.stat.exists
+
+    - name: Confirm server is reachable after maintenance
+      ansible.builtin.ping:
+
+    - name: Maintenance completed
+      ansible.builtin.debug:
+        msg: "Updates completed successfully on {{ inventory_hostname }}."
