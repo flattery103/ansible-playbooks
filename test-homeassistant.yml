@@ -1,0 +1,14 @@
+---
+- name: Test Home Assistant connection
+  hosts: homeassistant
+  gather_facts: false
+
+  tasks:
+    - name: Run Home Assistant info
+      ansible.builtin.raw: ha info
+      register: ha_info
+      changed_when: false
+
+    - name: Show Home Assistant information
+      ansible.builtin.debug:
+        var: ha_info.stdout_lines
