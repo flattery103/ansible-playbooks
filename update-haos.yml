@@ -1,69 +1,30 @@
 ---
-- name: Back up and update Home Assistant OS
+# ============================================================
+# PLAY 1 - Back up Home Assistant VM 108 to PBS
+# ============================================================
+
+- name: Back up Home Assistant VM before updates
   hosts: localhost
   gather_facts: false
   any_errors_fatal: true
 
   vars:
-    # --------------------------------------------------------
-    # Proxmox / PBS settings from Semaphore environment vars
-    # --------------------------------------------------------
+    # Proxmox / PBS settings supplied by Semaphore Environment
     pve_host: "{{ lookup('env', 'pve_host') }}"
     pve_user: "{{ lookup('env', 'pve_user') }}"
     pve_token_id: "{{ lookup('env', 'pve_token_id') }}"
     pve_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
     pbs_storage: "{{ lookup('env', 'pbs_storage') }}"
 
-    # --------------------------------------------------------
-    # Home Assistant VM
-    # --------------------------------------------------------
     ha_vmid: 108
 
-    # --------------------------------------------------------
-    # Home Assistant SSH connection
-    #
-    # Set HA_HOST in Semaphore to the IP address of Home
-    # Assistant.
-    # --------------------------------------------------------
-    ha_host: "{{ lookup('env', 'HA_HOST') }}"
-    ha_ssh_user: "root"
-    ha_ssh_key: "/home/semaphore/.ssh/homeassistant_ed25519"
-    ha_ssh_port: 22
-
-    # --------------------------------------------------------
-    # Backup settings
-    # --------------------------------------------------------
     backup_mode: "snapshot"
     backup_desc: "Home Assistant pre-update backup"
     wait_timeout_seconds: 7200
 
-    # --------------------------------------------------------
-    # The SSH app must be skipped because it cannot update
-    # itself while this automation is connected through it.
-    # --------------------------------------------------------
-    excluded_apps:
-      - core_ssh
-
-    # SSH options used for all HA commands
-    ssh_common_args:
-      - "-i"
-      - "{{ ha_ssh_key }}"
-      - "-p"
-      - "{{ ha_ssh_port | string }}"
-      - "-o"
-      - "BatchMode=yes"
-      - "-o"
-      - "ConnectTimeout=10"
-      - "-o"
-      - "StrictHostKeyChecking=accept-new"
-
   tasks:
 
-    # ========================================================
-    # Validate settings
-    # ========================================================
-
-    - name: Verify required Proxmox and Home Assistant settings
+    - name: Verify required Proxmox/PBS settings are present
       ansible.builtin.assert:
         that:
           - pve_host | length > 0
@@ -71,14 +32,10 @@
           - pve_token_id | length > 0
           - pve_token_secret | length > 0
           - pbs_storage | length > 0
-          - ha_host | length > 0
         fail_msg: >
-          Required Proxmox/PBS or Home Assistant environment
-          variables are missing. Maintenance has been stopped.
-
-    # ========================================================
-    # Back up Home Assistant VM to PBS
-    # ========================================================
+          Required Proxmox/PBS environment variables are missing.
+          Home Assistant maintenance has been cancelled.
+        success_msg: "Proxmox/PBS configuration validated."
 
     - name: Back up Home Assistant VM 108 to PBS
       community.proxmox.proxmox_backup:
@@ -108,22 +65,34 @@
           - ha_vm_backup is succeeded
         fail_msg: >
           Home Assistant VM backup failed.
-          Home Assistant updates have been cancelled.
+          No Home Assistant updates will be performed.
         success_msg: >
           Home Assistant VM 108 backup completed successfully.
 
+
+# ============================================================
+# PLAY 2 - Update Home Assistant
+# ============================================================
+
+- name: Update Home Assistant OS installation
+  hosts: homeassistant
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    # Terminal & SSH is the connection being used by Ansible.
+    # Do not try to update it during this session.
+    excluded_apps:
+      - core_ssh
+
+  tasks:
+
     # ========================================================
-    # Confirm SSH/HA CLI access
+    # Initial health check
     # ========================================================
 
-    - name: Verify SSH access to Home Assistant
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [ha_ssh_user ~ '@' ~ ha_host, 'ha info']
-          }}
+    - name: Verify Home Assistant CLI is available
+      ansible.builtin.raw: ha info
       register: ha_initial_info
       changed_when: false
 
@@ -131,103 +100,118 @@
       ansible.builtin.debug:
         var: ha_initial_info.stdout_lines
 
+
     # ========================================================
-    # Supervisor update
+    # Supervisor
     # ========================================================
 
-    - name: Get Supervisor update status
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha supervisor info --raw-json --no-progress'
-              ]
-          }}
+    - name: Get Supervisor update information
+      ansible.builtin.raw: ha supervisor info --no-progress --raw-json
       register: supervisor_info_raw
       changed_when: false
 
     - name: Parse Supervisor information
       ansible.builtin.set_fact:
-        supervisor_info: "{{ supervisor_info_raw.stdout | from_json }}"
+        supervisor_info: "{{ supervisor_info_raw.stdout | trim | from_json }}"
 
-    - name: Display Supervisor update status
+    - name: Show Supervisor version
       ansible.builtin.debug:
         msg: >-
-          Supervisor installed:
-          {{ supervisor_info.data.version }},
-          latest:
-          {{ supervisor_info.data.version_latest }},
-          update available:
-          {{ supervisor_info.data.update_available }}.
+          Supervisor:
+          installed={{ supervisor_info.data.version }},
+          latest={{ supervisor_info.data.version_latest }},
+          update_available={{ supervisor_info.data.update_available }}
 
-    - name: Update Home Assistant Supervisor
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha supervisor update --no-progress'
-              ]
-          }}
+    - name: Update Supervisor
+      ansible.builtin.raw: ha supervisor update --no-progress
       when: supervisor_info.data.update_available | bool
       register: supervisor_update
 
-    - name: Wait for Supervisor to respond after update
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha supervisor info --raw-json --no-progress'
-              ]
-          }}
-      register: supervisor_health
+    - name: Wait for Supervisor after update
+      ansible.builtin.raw: ha supervisor info --no-progress --raw-json
+      register: supervisor_wait
       changed_when: false
       retries: 30
       delay: 10
-      until: supervisor_health.rc == 0
+      until: supervisor_wait.rc == 0
       when: supervisor_info.data.update_available | bool
 
+
     # ========================================================
-    # Home Assistant apps/add-ons
+    # Home Assistant Core
     # ========================================================
 
-    - name: Get installed Home Assistant apps
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha addons list --raw-json --no-progress'
-              ]
-          }}
-      register: apps_raw
+    - name: Get Home Assistant Core update information
+      ansible.builtin.raw: ha core info --no-progress --raw-json
+      register: core_info_raw
       changed_when: false
 
-    - name: Parse Home Assistant app list
+    - name: Parse Home Assistant Core information
       ansible.builtin.set_fact:
-        apps_info: "{{ apps_raw.stdout | from_json }}"
+        core_info: "{{ core_info_raw.stdout | trim | from_json }}"
+
+    - name: Show Home Assistant Core version
+      ansible.builtin.debug:
+        msg: >-
+          Home Assistant Core:
+          installed={{ core_info.data.version }},
+          latest={{ core_info.data.version_latest }},
+          update_available={{ core_info.data.update_available }}
+
+    - name: Update Home Assistant Core with partial HA backup
+      ansible.builtin.raw: ha core update --backup --no-progress
+      when: core_info.data.update_available | bool
+      register: core_update
+
+    - name: Wait for Home Assistant Core after update
+      ansible.builtin.raw: ha core info --no-progress --raw-json
+      register: core_wait
+      changed_when: false
+      retries: 60
+      delay: 10
+      until:
+        - core_wait.rc == 0
+        - (core_wait.stdout | trim | from_json).data.state == "running"
+      when: core_info.data.update_available | bool
+
+
+    # ========================================================
+    # Home Assistant Apps
+    # ========================================================
+
+    - name: Get Home Assistant app list
+      ansible.builtin.raw: ha apps list --no-progress --raw-json
+      register: apps_info_raw
+      changed_when: false
+
+    - name: Parse Home Assistant app information
+      ansible.builtin.set_fact:
+        apps_info: "{{ apps_info_raw.stdout | trim | from_json }}"
+
+    # Handles both current "apps" naming and older "addons"
+    # response naming for compatibility.
+    - name: Build installed app list
+      ansible.builtin.set_fact:
+        installed_apps: >-
+          {{
+            apps_info.data.apps
+            | default(apps_info.data.addons | default([]))
+          }}
 
     - name: Build list of apps requiring updates
       ansible.builtin.set_fact:
         apps_to_update: >-
           {{
-            apps_info.data.addons
+            installed_apps
+            | selectattr('update_available', 'defined')
             | selectattr('update_available', 'equalto', true)
+            | selectattr('version', 'defined')
+            | rejectattr('version', 'equalto', none)
             | rejectattr('slug', 'in', excluded_apps)
             | list
           }}
 
-    - name: Show Home Assistant apps requiring updates
+    - name: Show apps requiring updates
       ansible.builtin.debug:
         msg: >-
           Apps to update:
@@ -235,190 +219,94 @@
             apps_to_update
             | map(attribute='name')
             | list
-            | default([])
           }}
 
     - name: Update Home Assistant apps
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha addons update ' ~ item.slug ~ ' --no-progress'
-              ]
-          }}
+      ansible.builtin.raw: >
+        ha apps update {{ item.slug }} --no-progress
       loop: "{{ apps_to_update }}"
       loop_control:
         label: "{{ item.name }}"
 
-    # ========================================================
-    # Home Assistant Core update
-    # ========================================================
-
-    - name: Get Home Assistant Core update status
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha core info --raw-json --no-progress'
-              ]
-          }}
-      register: core_info_raw
-      changed_when: false
-
-    - name: Parse Home Assistant Core information
-      ansible.builtin.set_fact:
-        core_info: "{{ core_info_raw.stdout | from_json }}"
-
-    - name: Display Core update status
-      ansible.builtin.debug:
-        msg: >-
-          Home Assistant Core installed:
-          {{ core_info.data.version }},
-          latest:
-          {{ core_info.data.version_latest }},
-          update available:
-          {{ core_info.data.update_available }}.
-
-    - name: Update Home Assistant Core and create partial HA backup
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha core update --backup --no-progress'
-              ]
-          }}
-      when: core_info.data.update_available | bool
-      register: core_update
-
-    - name: Wait for Home Assistant Core after update
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha core info --raw-json --no-progress'
-              ]
-          }}
-      register: core_health
-      changed_when: false
-      retries: 60
-      delay: 10
-      until: core_health.rc == 0
-      when: core_info.data.update_available | bool
 
     # ========================================================
-    # Home Assistant OS update
+    # Home Assistant OS
     # ========================================================
 
-    - name: Get Home Assistant OS update status
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha os info --raw-json --no-progress'
-              ]
-          }}
+    - name: Get Home Assistant OS update information
+      ansible.builtin.raw: ha os info --no-progress --raw-json
       register: os_info_raw
       changed_when: false
 
     - name: Parse Home Assistant OS information
       ansible.builtin.set_fact:
-        os_info: "{{ os_info_raw.stdout | from_json }}"
+        os_info: "{{ os_info_raw.stdout | trim | from_json }}"
 
-    - name: Display Home Assistant OS update status
+    - name: Show Home Assistant OS version
       ansible.builtin.debug:
         msg: >-
-          Home Assistant OS installed:
-          {{ os_info.data.version }},
-          latest:
-          {{ os_info.data.version_latest }},
-          update available:
-          {{ os_info.data.update_available }}.
+          Home Assistant OS:
+          installed={{ os_info.data.version }},
+          latest={{ os_info.data.version_latest }},
+          update_available={{ os_info.data.update_available }}
 
-    - name: Update Home Assistant OS
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha os update --no-progress'
-              ]
-          }}
+    - name: Install Home Assistant OS update
+      ansible.builtin.raw: ha os update --no-progress
       when: os_info.data.update_available | bool
       register: os_update
 
+
     # ========================================================
-    # Reboot after OS update
+    # Reboot after HAOS update
     # ========================================================
 
-    - name: Reboot Home Assistant host after OS update
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha host reboot'
-              ]
-          }}
+    - name: Reboot Home Assistant after OS update
+      ansible.builtin.raw: ha host reboot
       when: os_info.data.update_available | bool
-      async: 1
-      poll: 0
+      register: ha_reboot
+      failed_when: false
 
-    - name: Wait for Home Assistant SSH to go offline
+    - name: Wait for SSH to go offline
       ansible.builtin.wait_for:
-        host: "{{ ha_host }}"
-        port: "{{ ha_ssh_port }}"
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(22) }}"
         state: stopped
         timeout: 180
+      delegate_to: localhost
       when: os_info.data.update_available | bool
 
-    - name: Wait for Home Assistant SSH to return
+    - name: Wait for SSH to return
       ansible.builtin.wait_for:
-        host: "{{ ha_host }}"
-        port: "{{ ha_ssh_port }}"
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(22) }}"
         state: started
         delay: 10
         timeout: 900
+      delegate_to: localhost
       when: os_info.data.update_available | bool
+
 
     # ========================================================
     # Final health check
     # ========================================================
 
     - name: Wait for Home Assistant CLI to become available
-      ansible.builtin.command:
-        argv: >-
-          {{
-            ['ssh']
-            + ssh_common_args
-            + [
-                ha_ssh_user ~ '@' ~ ha_host,
-                'ha info'
-              ]
-          }}
+      ansible.builtin.raw: ha info
       register: final_ha_info
       changed_when: false
       retries: 60
       delay: 10
       until: final_ha_info.rc == 0
+
+    - name: Verify Home Assistant Core is running
+      ansible.builtin.raw: ha core info --no-progress --raw-json
+      register: final_core_raw
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - final_core_raw.rc == 0
+        - (final_core_raw.stdout | trim | from_json).data.state == "running"
 
     - name: Display final Home Assistant status
       ansible.builtin.debug:
@@ -428,4 +316,4 @@
       ansible.builtin.debug:
         msg: >
           Home Assistant VM 108 was backed up successfully and
-          all applicable Home Assistant updates completed.
+          all applicable Home Assistant platform updates completed.
